@@ -3091,6 +3091,7 @@ class AgentActivity(RecognitionHooks):
                     text_transforms=self._session.options.tts_text_transforms,
                     model=self.tts.model if self.tts else None,
                     provider=self.tts.provider if self.tts else None,
+                    tts_instance=self.tts,
                 )
                 if (
                     self.use_tts_aligned_transcript
@@ -3378,6 +3379,7 @@ class AgentActivity(RecognitionHooks):
             model_settings=model_settings,
             model=self.llm.model if self.llm else None,
             provider=self.llm.provider if self.llm else None,
+            llm_instance=self.llm if isinstance(self.llm, llm.LLM) else None,
         )
         tasks.append(llm_task)
 
@@ -3426,6 +3428,7 @@ class AgentActivity(RecognitionHooks):
                         text_transforms=self._session.options.tts_text_transforms,
                         model=self.tts.model if self.tts else None,
                         provider=self.tts.provider if self.tts else None,
+                        tts_instance=self.tts,
                     )
                     tasks.append(prev_tts_task)
                 seg = _SpeechSegment(text=utils.aio.Chan[str](), tts=tts_data)
@@ -4230,6 +4233,7 @@ class AgentActivity(RecognitionHooks):
                         text_transforms=self._session.options.tts_text_transforms,
                         model=self.tts.model if self.tts else None,
                         provider=self.tts.provider if self.tts else None,
+                        tts_instance=self.tts,
                     )
 
                     if (
