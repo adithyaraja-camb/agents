@@ -59,3 +59,14 @@ DEFAULT_LANGUAGE = "en-us"
 DEFAULT_MODEL: SpeechModel = "mars-flash"
 DEFAULT_OUTPUT_FORMAT: OutputFormat = "pcm_s16le"
 NUM_CHANNELS = 1
+
+# Latency/quality tradeoff for a realtime speech-to-speech session. "fast" accepts audio
+# almost immediately; "slow" covers more languages and translates more accurately, at the
+# cost of a cold boot before the session is ready.
+RealtimeMode = Literal["fast", "slow"]
+
+DEFAULT_REALTIME_MODE: RealtimeMode = "fast"
+
+# The realtime endpoint speaks 24kHz mono PCM16 in both directions, unlike the TTS models
+# above, whose rate varies per model.
+REALTIME_SAMPLE_RATE = 24000

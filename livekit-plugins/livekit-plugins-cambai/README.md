@@ -1,6 +1,6 @@
 # Camb.ai Plugin for LiveKit Agents
 
-Text-to-Speech plugin for [Camb.ai](https://camb.ai) TTS API, powered by MARS technology.
+Text-to-Speech and realtime speech-to-speech translation for [Camb.ai](https://camb.ai), powered by MARS technology.
 
 ## Features
 
@@ -10,6 +10,7 @@ Text-to-Speech plugin for [Camb.ai](https://camb.ai) TTS API, powered by MARS te
 - Support for 140+ languages
 - Real-time HTTP streaming
 - Pre-built voice library
+- Realtime speech-to-speech translation: speech in one language, speech in another, in the speaker's voice
 
 ## Installation
 
@@ -233,6 +234,43 @@ Coming soon:
 - [Camb.ai Documentation](https://docs.camb.ai/)
 - [LiveKit Agents Documentation](https://docs.livekit.io/agents/)
 - [GitHub Repository](https://github.com/livekit/agents)
+
+## Realtime speech-to-speech translation
+
+`cambai.realtime.RealtimeModel` translates speech to speech: the participant speaks one
+language and the model returns the same utterance spoken in another, along with a
+transcript of what was said and the translated text. It replaces the usual
+STT + LLM + TTS chain with a single connection.
+
+```python
+from livekit.agents import AgentSession
+from livekit.plugins import cambai, silero
+
+session = AgentSession(
+    llm=cambai.realtime.RealtimeModel(
+        source_language="en-US",   # what the speaker says
+        target_language="fr-FR",   # what the room hears
+        mode="slow",
+    ),
+    # The model reports no server-side speech start/stop events, so turn taking is
+    # driven locally.
+    vad=silero.VAD.load(),
+)
+```
+
+Audio is 24 kHz mono PCM16 in both directions; frames at any other rate are resampled
+for you. `voice_id` synthesizes the translation with one of your cloned voices instead of
+a built-in one, and `base_url` points the session at a non-production deployment.
+
+### Choosing a mode
+
+`mode="fast"` answers sooner and `mode="slow"` translates more accurately over a longer
+language list. The difference that matters in practice is how long a pause each one needs
+before it treats an utterance as finished and translates it: measured against
+`realtime.camb.ai`, `fast` responds after roughly half a second of silence, while `slow`
+waits about a second and a half. Either is invisible in a live call, where the microphone
+keeps streaming, but a caller that stops sending audio the instant the speech ends will
+see nothing back from `slow` — feed the trailing silence too.
 
 ## License
 
