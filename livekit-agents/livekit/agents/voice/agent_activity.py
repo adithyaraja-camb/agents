@@ -227,8 +227,10 @@ def _record_queue_wait(speech_handle: SpeechHandle) -> None:
     """Stamp how long the speech sat in the queue on its agent_turn span.
 
     Module-level: tests drive the reply tasks with stand-in activities."""
-    if (queue_wait := speech_handle._queue_wait()) is None:
-        return
+    if (
+        queue_wait := speech_handle._queue_wait()
+    ) is None or speech_handle._agent_turn_context is None:
+        return  # no agent_turn span yet: never fall back to whatever span is current
     span = trace.get_current_span(context=speech_handle._agent_turn_context)
     span.set_attribute(trace_types.ATTR_SPEECH_QUEUE_WAIT, queue_wait)
 
@@ -3852,7 +3854,7 @@ class AgentActivity(RecognitionHooks):
         if speech_handle.allow_interruptions:
             authorization_tasks.append(asyncio.ensure_future(self._user_silence_event.wait()))
         await speech_handle.wait_if_not_interrupted(authorization_tasks)
-        _record_queue_wait(speech_handle)
+        # the queue wait is recorded by _realtime_generation_task, which owns the agent_turn span
         if speech_handle.interrupted:
             await utils.aio.cancel_and_wait(*authorization_tasks)
             return
