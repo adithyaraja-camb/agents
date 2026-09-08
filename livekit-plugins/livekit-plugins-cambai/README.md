@@ -242,10 +242,27 @@ language and the model returns the same utterance spoken in another, along with 
 transcript of what was said and the translated text. It replaces the usual
 STT + LLM + TTS chain with a single connection.
 
-It is under `experimental` because `AgentSession` support is not finished: that
-orchestration treats incoming speech as an interruption, which a translator's
-continuously-speaking source triggers constantly. Drive the session directly instead, as
-below and as in `examples/other/translation/camb_realtime_translator.py`.
+Drop it into an `AgentSession` like any other realtime model:
+
+```python
+from livekit.agents import AgentSession
+from livekit.plugins import cambai
+
+session = AgentSession(
+    llm=cambai.experimental.realtime.RealtimeModel(
+        source_language="en-US",
+        target_language="fr-FR",
+    ),
+)
+```
+
+No VAD is needed: the endpoint segments utterances itself, so the model reports
+server-side turn detection and the session does not run its own barge-in detection. That
+matters for translation, where the speaker never stops talking and would otherwise be
+treated as interrupting the agent.
+
+To publish a translated track per speaker instead, drive the session directly — see
+`examples/other/translation/camb_realtime_translator.py`:
 
 ```python
 from livekit import rtc

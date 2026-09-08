@@ -98,7 +98,9 @@ class RealtimeModel(llm.RealtimeModel):
         super().__init__(
             capabilities=llm.RealtimeCapabilities(
                 message_truncation=False,
-                turn_detection=False,
+                # The endpoint segments utterances itself, so the session must not run its
+                # own barge-in detection: a translator's speaker never stops talking.
+                turn_detection=True,
                 user_transcription=True,
                 auto_tool_reply_generation=False,
                 audio_output=True,
