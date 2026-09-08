@@ -33,9 +33,9 @@ from livekit.agents import APIConnectionError, APIStatusError, llm, utils
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
 from livekit.agents.utils import is_given
 
-from ..log import logger
-from ..models import DEFAULT_REALTIME_MODE, NUM_CHANNELS, REALTIME_SAMPLE_RATE, RealtimeMode
-from ..tts import API_KEY_HEADER
+from ...log import logger
+from ...models import DEFAULT_REALTIME_MODE, NUM_CHANNELS, REALTIME_SAMPLE_RATE, RealtimeMode
+from ...tts import API_KEY_HEADER
 
 REALTIME_BASE_URL = "wss://realtime.camb.ai"
 _REALTIME_PATH = "/v1/realtime"

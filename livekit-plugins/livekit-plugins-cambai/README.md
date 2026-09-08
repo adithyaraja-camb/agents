@@ -237,18 +237,21 @@ Coming soon:
 
 ## Realtime speech-to-speech translation
 
-`cambai.realtime.RealtimeModel` translates speech to speech: the participant speaks one
+`cambai.experimental.realtime.RealtimeModel` translates speech to speech: the participant speaks one
 language and the model returns the same utterance spoken in another, along with a
 transcript of what was said and the translated text. It replaces the usual
 STT + LLM + TTS chain with a single connection.
 
-Feed it a participant's audio and publish what comes back:
+It is under `experimental` because `AgentSession` support is not finished: that
+orchestration treats incoming speech as an interruption, which a translator's
+continuously-speaking source triggers constantly. Drive the session directly instead, as
+below and as in `examples/other/translation/camb_realtime_translator.py`.
 
 ```python
 from livekit import rtc
 from livekit.plugins import cambai
 
-model = cambai.realtime.RealtimeModel(
+model = cambai.experimental.realtime.RealtimeModel(
     source_language="en-US",   # what the speaker says
     target_language="fr-FR",   # what the room hears
     mode="slow",
