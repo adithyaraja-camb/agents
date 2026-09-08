@@ -161,8 +161,6 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
 
         self._main_atask = asyncio.create_task(self._main_task(), name="cambai-realtime")
 
-    # ------------------------------------------------------------------ session
-
     async def _main_task(self) -> None:
         try:
             await self._run()
@@ -294,8 +292,6 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
             if gen and gen.text_done and time.monotonic() - gen.last_audio_at > _AUDIO_IDLE_TIMEOUT:
                 self._finish_generation()
 
-    # --------------------------------------------------------------- generation
-
     def _ensure_generation(self) -> _Generation:
         if self._current is not None:
             return self._current
@@ -368,8 +364,6 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
                 turn_started_at=self._turn_started_at,
             ),
         )
-
-    # -------------------------------------------------------------------- input
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
         if self._turn_started_at is None:
@@ -444,8 +438,6 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         audio_transcript: NotGivenOr[str] = NOT_GIVEN,
     ) -> None:
         pass
-
-    # ------------------------------------------------------------------ context
 
     @property
     def chat_ctx(self) -> llm.ChatContext:
