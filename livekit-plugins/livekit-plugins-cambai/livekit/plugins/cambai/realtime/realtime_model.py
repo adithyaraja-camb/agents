@@ -40,8 +40,10 @@ from ..tts import API_KEY_HEADER
 REALTIME_BASE_URL = "wss://realtime.camb.ai"
 _REALTIME_PATH = "/v1/realtime"
 
-# response.audio.done arrives before the deltas it refers to, so it cannot end a turn.
-_AUDIO_IDLE_TIMEOUT = 1.0
+# Only a fallback: text.done and audio.done arrive together and end a response. This
+# releases a response the server never completes. Measured intra-response audio gaps
+# reach 2.25s, so the window sits well above that to avoid ending a turn mid-speech.
+_AUDIO_IDLE_TIMEOUT = 6.0
 
 
 @dataclass
@@ -65,6 +67,7 @@ class _Generation:
     modalities: asyncio.Future[list[Literal["text", "audio"]]]
     started_at: float
     text_done: bool = False
+    audio_done: bool = False
     last_audio_at: float = field(default_factory=time.monotonic)
 
 
@@ -154,6 +157,10 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         self._ready = asyncio.Event()
         self._current: _Generation | None = None
         self._input_resampler: rtc.AudioResampler | None = None
+        # The server sends 400ms blobs; the room pipeline expects small, even frames.
+        self._bstream = utils.audio.AudioByteStream(
+            REALTIME_SAMPLE_RATE, NUM_CHANNELS, samples_per_channel=REALTIME_SAMPLE_RATE // 10
+        )
         self._chat_ctx = llm.ChatContext.empty()
         self._pending_reply: asyncio.Future[llm.GenerationCreatedEvent] | None = None
         self._turn_started_at: float | None = None
@@ -266,11 +273,15 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         elif etype == "response.text.done":
             gen = self._ensure_generation()
             gen.text_done = True
+            self._finish_if_complete(gen)
         elif etype == "response.audio.delta":
             if raw := (event.get("delta") or event.get("audio")):
                 self._push_audio(base64.b64decode(raw))
         elif etype == "response.audio.done":
-            pass
+            current = self._current
+            if current is not None:
+                current.audio_done = True
+                self._finish_if_complete(current)
         elif etype == "error":
             message = (event.get("error") or {}).get("message") or "unknown realtime error"
             logger.error("camb.ai realtime error: %s", message)
@@ -284,12 +295,20 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
                 ),
             )
 
+    def _finish_if_complete(self, gen: _Generation) -> None:
+        """A response ends when the server has reported both its text and its audio done."""
+        if gen.text_done and gen.audio_done:
+            self._finish_generation()
+
     async def _watchdog_task(self) -> None:
-        """Close a generation once its text is done and its audio has gone quiet."""
+        """Backstop for a response the server never reports as done."""
         while True:
             await asyncio.sleep(0.2)
             gen = self._current
-            if gen and gen.text_done and time.monotonic() - gen.last_audio_at > _AUDIO_IDLE_TIMEOUT:
+            if gen and time.monotonic() - gen.last_audio_at > _AUDIO_IDLE_TIMEOUT:
+                # Not conditional on text.done: the server can stream deltas for a
+                # response it never reports as done, and a turn that never ends blocks
+                # every utterance after it.
                 self._finish_generation()
 
     def _ensure_generation(self) -> _Generation:
@@ -335,19 +354,15 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
             return
         gen = self._ensure_generation()
         gen.last_audio_at = time.monotonic()
-        gen.audio_ch.send_nowait(
-            rtc.AudioFrame(
-                data=data,
-                sample_rate=REALTIME_SAMPLE_RATE,
-                num_channels=NUM_CHANNELS,
-                samples_per_channel=len(data) // 2,
-            )
-        )
+        for frame in self._bstream.push(data):
+            gen.audio_ch.send_nowait(frame)
 
     def _finish_generation(self) -> None:
         gen, self._current = self._current, None
         if gen is None:
             return
+        for frame in self._bstream.flush():
+            gen.audio_ch.send_nowait(frame)
         for ch in (gen.text_ch, gen.audio_ch, gen.message_ch):
             if not ch.closed:
                 ch.close()
@@ -448,10 +463,9 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         return llm.ToolContext.empty()
 
     async def update_instructions(self, instructions: str) -> None:
-        raise llm.RealtimeError(
-            "Camb.ai realtime translation takes no instructions; "
-            "set source_language and target_language on the model instead"
-        )
+        # AgentSession sets instructions on startup; a translation has none to steer.
+        if instructions:
+            logger.warning("camb.ai realtime translation ignores instructions")
 
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         pass

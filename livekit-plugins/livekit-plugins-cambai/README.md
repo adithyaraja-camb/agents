@@ -242,35 +242,76 @@ language and the model returns the same utterance spoken in another, along with 
 transcript of what was said and the translated text. It replaces the usual
 STT + LLM + TTS chain with a single connection.
 
-```python
-from livekit.agents import AgentSession
-from livekit.plugins import cambai, silero
+Feed it a participant's audio and publish what comes back:
 
-session = AgentSession(
-    llm=cambai.realtime.RealtimeModel(
-        source_language="en-US",   # what the speaker says
-        target_language="fr-FR",   # what the room hears
-        mode="slow",
-    ),
-    # The model reports no server-side speech start/stop events, so turn taking is
-    # driven locally.
-    vad=silero.VAD.load(),
+```python
+from livekit import rtc
+from livekit.plugins import cambai
+
+model = cambai.realtime.RealtimeModel(
+    source_language="en-US",   # what the speaker says
+    target_language="fr-FR",   # what the room hears
+    mode="slow",
 )
+session = model.session()
+
+translated = rtc.AudioSource(24000, 1)
+await ctx.room.local_participant.publish_track(
+    rtc.LocalAudioTrack.create_audio_track("translated-fr-FR", translated),
+    rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE),
+)
+
+
+async def forward(track: rtc.Track) -> None:
+    async for ev in rtc.AudioStream(track):
+        session.push_audio(ev.frame)
+
+
+@session.on("input_audio_transcription_completed")
+def _on_transcript(ev) -> None:
+    print("source:", ev.transcript)
+
+
+@session.on("generation_created")
+def _on_generation(ev) -> None:
+    async def play() -> None:
+        async for msg in ev.message_stream:
+            async for frame in msg.audio_stream:
+                await translated.capture_frame(frame)
+
+    asyncio.create_task(play())
 ```
 
-Audio is 24 kHz mono PCM16 in both directions; frames at any other rate are resampled
-for you. `voice_id` synthesizes the translation with one of your cloned voices instead of
-a built-in one, and `base_url` points the session at a non-production deployment.
+Each generation also carries `msg.text_stream`, the translated text, which pairs with the
+source transcript above for captions.
+
+Audio is 24 kHz mono PCM16 in both directions; frames at any other rate are resampled for
+you. `voice_id` synthesizes the translation with one of your cloned voices instead of a
+built-in one, and `base_url` points the session at a non-production deployment.
 
 ### Choosing a mode
 
-`mode="fast"` answers sooner and `mode="slow"` translates more accurately over a longer
-language list. The difference that matters in practice is how long a pause each one needs
-before it treats an utterance as finished and translates it: measured against
-`realtime.camb.ai`, `fast` responds after roughly half a second of silence, while `slow`
-waits about a second and a half. Either is invisible in a live call, where the microphone
-keeps streaming, but a caller that stops sending audio the instant the speech ends will
-see nothing back from `slow` — feed the trailing silence too.
+`mode="fast"` starts speaking sooner; `mode="slow"` covers a longer language list. Both
+translate every complete utterance they are given — measured against `realtime.camb.ai`
+on English recordings from 3.9s to 12s, neither mode dropped a finished sentence, and
+translation quality was comparable in both.
+
+What both modes ignore is an *incomplete* utterance. Feeding audio that stops mid-sentence
+leaves that fragment untranslated, which is correct but surprising if you are replaying a
+file you cut at an arbitrary offset: cut on pauses, or accept that the trailing fragment
+goes nowhere. A live microphone raises this only at the very end of a call.
+
+### Turn taking
+
+The endpoint segments utterances itself and streams translations continuously; it emits no
+speech-start or speech-stop events, so `capabilities.turn_detection` is `False`. Nothing
+needs committing and no reply needs requesting — `commit_audio`, `clear_audio` and
+`interrupt` are inert, and `generate_reply` hands back the translation the next utterance
+produces.
+
+Note that a conversational orchestrator is a poor fit for a translator: the speaker never
+stops talking, so anything that treats incoming speech as an interruption will cancel the
+translation mid-playback. Drive the session directly, as above.
 
 ## License
 
