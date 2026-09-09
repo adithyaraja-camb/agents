@@ -32,9 +32,9 @@ logger = logging.getLogger("camb-translator")
 SOURCE_LANGUAGE = "en-US"
 TARGET_LANGUAGE = "fr-FR"
 
-# "slow" covers more languages; "fast" begins speaking sooner. Both translate every
-# complete utterance.
-MODE = "slow"
+# "fast" begins speaking sooner; "slow" covers a longer language list. Both translate
+# every complete utterance, so a live translator wants the lower latency.
+MODE = "fast"
 
 SAMPLE_RATE = 24000
 NUM_CHANNELS = 1

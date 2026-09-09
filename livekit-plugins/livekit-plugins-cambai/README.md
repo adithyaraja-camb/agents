@@ -271,7 +271,7 @@ from livekit.plugins import cambai
 model = cambai.experimental.realtime.RealtimeModel(
     source_language="en-US",   # what the speaker says
     target_language="fr-FR",   # what the room hears
-    mode="slow",
+    mode="fast",
 )
 session = model.session()
 

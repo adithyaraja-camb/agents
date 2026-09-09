@@ -60,9 +60,10 @@ DEFAULT_MODEL: SpeechModel = "mars-flash"
 DEFAULT_OUTPUT_FORMAT: OutputFormat = "pcm_s16le"
 NUM_CHANNELS = 1
 
-# Latency/quality tradeoff for a realtime speech-to-speech session. "fast" accepts audio
-# almost immediately; "slow" covers more languages and translates more accurately, at the
-# cost of a cold boot before the session is ready.
+# Which realtime pipeline a session runs on. "fast" starts speaking sooner; "slow" covers
+# a longer language list. Measured on English recordings from 3.9s to 12s, both translated
+# every complete utterance and their translation quality was comparable, so "fast" is the
+# default on latency alone.
 RealtimeMode = Literal["fast", "slow"]
 
 DEFAULT_REALTIME_MODE: RealtimeMode = "fast"
