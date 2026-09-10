@@ -17,16 +17,25 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
 import os
 import time
 import weakref
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
-import aiohttp
+from camb.realtime import (
+    AudioDeltaEvent,
+    ClosedEvent,
+    ErrorEvent,
+    RealtimeError,
+    RealtimeSession as CambSession,
+    ServerEventType,
+    TextDeltaEvent,
+    TextDoneEvent,
+    TranscriptCompletedEvent,
+    connect as camb_connect,
+)
 
 from livekit import rtc
 from livekit.agents import APIConnectionError, APIStatusError, llm, utils
@@ -35,10 +44,8 @@ from livekit.agents.utils import is_given
 
 from ...log import logger
 from ...models import DEFAULT_REALTIME_MODE, NUM_CHANNELS, REALTIME_SAMPLE_RATE, RealtimeMode
-from ...tts import API_KEY_HEADER
 
 REALTIME_BASE_URL = "wss://realtime.camb.ai"
-_REALTIME_PATH = "/v1/realtime"
 
 # Only a fallback: text.done and audio.done arrive together and end a response. This
 # releases a response the server never completes. Measured intra-response audio gaps
@@ -81,7 +88,6 @@ class RealtimeModel(llm.RealtimeModel):
         voice_id: int | None = None,
         api_key: str | None = None,
         base_url: str = REALTIME_BASE_URL,
-        http_session: aiohttp.ClientSession | None = None,
     ) -> None:
         """Translate speech to speech with Camb.ai.
 
@@ -93,7 +99,6 @@ class RealtimeModel(llm.RealtimeModel):
                 omitted the server picks a built-in voice for ``target_language``.
             api_key: Camb.ai API key. Falls back to the ``CAMB_API_KEY`` env var.
             base_url: Realtime endpoint. Override to reach a non-production deployment.
-            http_session: Session to use instead of the shared one.
         """
         super().__init__(
             capabilities=llm.RealtimeCapabilities(
@@ -123,7 +128,6 @@ class RealtimeModel(llm.RealtimeModel):
             api_key=camb_api_key,
             base_url=base_url,
         )
-        self._session = http_session
         self._sessions = weakref.WeakSet[RealtimeSession]()
 
     @property
@@ -133,11 +137,6 @@ class RealtimeModel(llm.RealtimeModel):
     @property
     def provider(self) -> str:
         return "Camb.ai"
-
-    def _ensure_http_session(self) -> aiohttp.ClientSession:
-        if not self._session:
-            self._session = utils.http_context.http_session()
-        return self._session
 
     def session(self, *, turn_detection_disabled: bool = False) -> RealtimeSession:
         sess = RealtimeSession(self)
@@ -155,8 +154,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         self._realtime_model: RealtimeModel = realtime_model
         self._opts = realtime_model._opts
 
-        self._msg_ch = utils.aio.Chan[dict[str, Any]]()
-        self._ready = asyncio.Event()
+        self._msg_ch = utils.aio.Chan[bytes]()
         self._current: _Generation | None = None
         self._input_resampler: rtc.AudioResampler | None = None
         # The server sends 400ms blobs; the room pipeline expects small, even frames.
@@ -189,113 +187,94 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
             raise
 
     async def _run(self) -> None:
-        url = f"{self._opts.base_url}{_REALTIME_PATH}?mode={self._opts.mode}"
-        session = self._realtime_model._ensure_http_session()
-
         try:
-            ws = await session.ws_connect(url, headers={API_KEY_HEADER: self._opts.api_key})
-        except aiohttp.ClientResponseError as e:
-            raise APIStatusError(
-                "failed to connect to the Camb.ai realtime endpoint",
-                status_code=e.status,
-                body=e.message,
-            ) from e
-        except Exception as e:
+            session = await camb_connect(
+                self._opts.api_key,
+                base_url=self._opts.base_url,
+                source_language=self._opts.source_language,
+                target_language=self._opts.target_language,
+                mode=self._opts.mode,
+                voice_id=self._opts.voice_id,
+            )
+        except RealtimeError as e:
             raise APIConnectionError("failed to connect to the Camb.ai realtime endpoint") from e
 
-        session_update = {
-            "type": "session.update",
-            "session": {
-                "mode": self._opts.mode,
-                "source_language": self._opts.source_language,
-                "target_language": self._opts.target_language,
-                "output_modalities": ["text", "audio"],
-            },
-            "auth": {"api_key": self._opts.api_key},
-        }
-        if self._opts.voice_id is not None:
-            session_update["session"]["voice"] = {  # type: ignore[index]
-                "type": "cloned",
-                "voice_id": self._opts.voice_id,
-            }
-        await ws.send_str(json.dumps(session_update))
+        self._subscribe(session)
 
         tasks = [
-            asyncio.create_task(self._send_task(ws), name="cambai-realtime-send"),
-            asyncio.create_task(self._recv_task(ws), name="cambai-realtime-recv"),
+            asyncio.create_task(self._send_task(session), name="cambai-realtime-send"),
             asyncio.create_task(self._watchdog_task(), name="cambai-realtime-watchdog"),
         ]
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.gather(session.run_until_closed(), *tasks)
         finally:
             await utils.aio.cancel_and_wait(*tasks)
-            await ws.close()
+            await session.close()
             self._finish_generation()
 
-    async def _send_task(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        # Audio sent before the session exists is discarded by the server.
-        await self._ready.wait()
-        async for msg in self._msg_ch:
-            await ws.send_str(json.dumps(msg))
+    def _subscribe(self, session: CambSession) -> None:
+        def on_transcript(event: TranscriptCompletedEvent) -> None:
+            self._emit_input_transcript(event.transcript)
 
-    async def _recv_task(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        while True:
-            msg = await ws.receive()
-            if msg.type in (
-                aiohttp.WSMsgType.CLOSE,
-                aiohttp.WSMsgType.CLOSED,
-                aiohttp.WSMsgType.CLOSING,
-            ):
-                if not self._ready.is_set():
-                    raise APIConnectionError(
-                        "the Camb.ai realtime session closed before it became ready"
-                    )
-                return
-
-            if msg.type == aiohttp.WSMsgType.BINARY:
-                self._push_audio(msg.data)
-                continue
-
-            if msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-
-            self._handle_event(json.loads(msg.data))
-
-    def _handle_event(self, event: dict[str, Any]) -> None:
-        etype = event.get("type")
-
-        if etype == "session.created":
-            self._ready.set()
-        elif etype == "conversation.item.input_audio_transcription.completed":
-            self._emit_input_transcript(event.get("transcript", ""))
-        elif etype == "response.text.delta":
+        def on_text_delta(event: TextDeltaEvent) -> None:
             gen = self._ensure_generation()
-            if delta := event.get("delta", ""):
-                gen.text_ch.send_nowait(delta)
-        elif etype == "response.text.done":
+            if event.delta:
+                gen.text_ch.send_nowait(event.delta)
+
+        def on_text_done(_: TextDoneEvent) -> None:
             gen = self._ensure_generation()
             gen.text_done = True
             self._finish_if_complete(gen)
-        elif etype == "response.audio.delta":
-            if raw := (event.get("delta") or event.get("audio")):
-                self._push_audio(base64.b64decode(raw))
-        elif etype == "response.audio.done":
+
+        def on_audio_delta(event: AudioDeltaEvent) -> None:
+            if event.data:
+                self._push_audio(event.data)
+
+        def on_audio_done(_: object) -> None:
             current = self._current
             if current is not None:
                 current.audio_done = True
                 self._finish_if_complete(current)
-        elif etype == "error":
-            message = (event.get("error") or {}).get("message") or "unknown realtime error"
-            logger.error("camb.ai realtime error: %s", message)
+
+        def on_error(event: ErrorEvent) -> None:
+            logger.error("camb.ai realtime error: %s", event.message)
             self.emit(
                 "error",
                 llm.RealtimeModelError(
                     timestamp=time.time(),
                     label=self._realtime_model.label,
-                    error=APIStatusError(message, status_code=500, body=None),
+                    error=APIStatusError(event.message, status_code=500, body=None),
                     recoverable=True,
                 ),
             )
+
+        def on_closed(event: ClosedEvent) -> None:
+            if not session.is_ready:
+                logger.error(
+                    "camb.ai realtime closed before the session became ready: %s %s",
+                    event.code,
+                    event.reason,
+                )
+
+        session.on(ServerEventType.TRANSCRIPT_COMPLETED, on_transcript)
+        session.on(ServerEventType.TEXT_DELTA, on_text_delta)
+        session.on(ServerEventType.TEXT_DONE, on_text_done)
+        session.on(ServerEventType.AUDIO_DELTA, on_audio_delta)
+        session.on(ServerEventType.AUDIO_DONE, on_audio_done)
+        session.on(ServerEventType.ERROR, on_error)
+        session.on(ServerEventType.CLOSED, on_closed)
+
+    async def _send_task(self, session: CambSession) -> None:
+        # Audio sent before the session exists is discarded by the server.
+        try:
+            await session.wait_until_ready(timeout=None)
+        except RealtimeError as e:
+            raise APIConnectionError(
+                "the Camb.ai realtime session closed before it became ready"
+            ) from e
+
+        async for pcm in self._msg_ch:
+            await session.send_audio(pcm)
 
     def _finish_if_complete(self, gen: _Generation) -> None:
         """A response ends when the server has reported both its text and its audio done."""
@@ -386,12 +365,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         if self._turn_started_at is None:
             self._turn_started_at = time.time()
         for f in self._resample(frame):
-            self._msg_ch.send_nowait(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(f.data.tobytes()).decode(),
-                }
-            )
+            self._msg_ch.send_nowait(f.data.tobytes())
 
     def _resample(self, frame: rtc.AudioFrame) -> Iterator[rtc.AudioFrame]:
         if self._input_resampler and frame.sample_rate != self._input_resampler._input_rate:

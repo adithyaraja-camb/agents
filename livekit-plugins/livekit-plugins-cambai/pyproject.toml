@@ -36,6 +36,7 @@ classifiers = [
 ]
 dependencies = [
     "livekit-agents>=1.8.0",
+    "camb-sdk>=1.6.0",
 ]
 
 [project.optional-dependencies]
