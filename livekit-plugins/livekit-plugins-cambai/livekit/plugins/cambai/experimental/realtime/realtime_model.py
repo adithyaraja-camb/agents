@@ -21,7 +21,7 @@ import os
 import time
 import weakref
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from camb.realtime import (
@@ -47,11 +47,6 @@ from ...models import DEFAULT_REALTIME_MODE, NUM_CHANNELS, REALTIME_SAMPLE_RATE,
 
 REALTIME_BASE_URL = "wss://realtime.camb.ai"
 
-# Only a fallback: text.done and audio.done arrive together and end a response. This
-# releases a response the server never completes. Measured intra-response audio gaps
-# reach 2.25s, so the window sits well above that to avoid ending a turn mid-speech.
-_AUDIO_IDLE_TIMEOUT = 6.0
-
 
 @dataclass
 class _RealtimeOptions:
@@ -75,7 +70,6 @@ class _Generation:
     started_at: float
     text_done: bool = False
     audio_done: bool = False
-    last_audio_at: float = field(default_factory=time.monotonic)
 
 
 class RealtimeModel(llm.RealtimeModel):
@@ -201,10 +195,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
 
         self._subscribe(session)
 
-        tasks = [
-            asyncio.create_task(self._send_task(session), name="cambai-realtime-send"),
-            asyncio.create_task(self._watchdog_task(), name="cambai-realtime-watchdog"),
-        ]
+        tasks = [asyncio.create_task(self._send_task(session), name="cambai-realtime-send")]
         try:
             await asyncio.gather(session.run_until_closed(), *tasks)
         finally:
@@ -281,17 +272,6 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         if gen.text_done and gen.audio_done:
             self._finish_generation()
 
-    async def _watchdog_task(self) -> None:
-        """Backstop for a response the server never reports as done."""
-        while True:
-            await asyncio.sleep(0.2)
-            gen = self._current
-            if gen and time.monotonic() - gen.last_audio_at > _AUDIO_IDLE_TIMEOUT:
-                # Not conditional on text.done: the server can stream deltas for a
-                # response it never reports as done, and a turn that never ends blocks
-                # every utterance after it.
-                self._finish_generation()
-
     def _ensure_generation(self) -> _Generation:
         if self._current is not None:
             return self._current
@@ -334,7 +314,6 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         if not data:
             return
         gen = self._ensure_generation()
-        gen.last_audio_at = time.monotonic()
         for frame in self._bstream.push(data):
             gen.audio_ch.send_nowait(frame)
 
