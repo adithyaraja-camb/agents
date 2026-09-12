@@ -50,9 +50,9 @@ DEFAULT_MAX_SESSION_DURATION = 50 * 60
 _DRAIN_TIMEOUT = 30.0
 _INITIAL_RETRY_DELAY = 1.0
 _MAX_RETRY_DELAY = 30.0
-# A scheduled handover always runs a full session, so only genuine failures reach this.
-# Bounded because an endpoint that accepts a connection and drops it immediately -- an
-# unpaid account answers exactly that way -- is not something retrying can fix.
+# Consecutive sessions that never became ready. A session that did become ready and then
+# closed is not counted: the endpoint drops an idle connection after about 60 seconds, so
+# a speaker who stops talking produces exactly that, and it has to reconnect indefinitely.
 _MAX_RECONNECT_ATTEMPTS = 3
 
 
@@ -225,10 +225,8 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
             else:
                 if reconnecting:
                     self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
-                # A scheduled handover is the only end that means the session worked.
-                # Readiness and elapsed time do not separate it from an endpoint that
-                # accepts the session and drops it a minute later.
-                if await self._run_session(session):
+                await self._run_session(session)
+                if session.is_ready:
                     attempts = 0
                     retry_delay = _INITIAL_RETRY_DELAY
                 else:
