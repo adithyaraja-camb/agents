@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .realtime_model import DEFAULT_MAX_SESSION_DURATION, RealtimeModel, RealtimeSession
+from .realtime_model import RealtimeModel, RealtimeSession
 
-__all__ = ["DEFAULT_MAX_SESSION_DURATION", "RealtimeModel", "RealtimeSession"]
+__all__ = ["RealtimeModel", "RealtimeSession"]

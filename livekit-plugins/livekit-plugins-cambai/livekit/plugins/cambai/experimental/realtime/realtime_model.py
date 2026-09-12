@@ -21,7 +21,6 @@ import os
 import time
 import weakref
 from collections.abc import Iterator
-from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -46,17 +45,6 @@ from livekit.agents.utils import is_given
 from ...log import logger
 from ...models import DEFAULT_REALTIME_MODE, NUM_CHANNELS, REALTIME_SAMPLE_RATE, RealtimeMode
 
-DEFAULT_MAX_SESSION_DURATION = 50 * 60
-_DRAIN_TIMEOUT = 30.0
-_INITIAL_RETRY_DELAY = 1.0
-_MAX_RETRY_DELAY = 30.0
-# Consecutive connections that never produced a working session. A session that did
-# become ready is not counted however it ended: the endpoint closes an idle connection
-# after about 60 seconds, and a participant who has muted has to reconnect until they
-# speak again. An empty room is not this loop's problem -- LiveKit closes the agent
-# session when the participant disconnects, which closes the channel and ends the loop.
-_MAX_CONNECT_FAILURES = 3
-
 
 @dataclass
 class _RealtimeOptions:
@@ -66,7 +54,6 @@ class _RealtimeOptions:
     voice_id: int | None
     api_key: str
     base_url: str | None
-    max_session_duration: float | None
 
 
 @dataclass
@@ -93,7 +80,6 @@ class RealtimeModel(llm.RealtimeModel):
         voice_id: int | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        max_session_duration: float | None = DEFAULT_MAX_SESSION_DURATION,
     ) -> None:
         """Translate speech to speech with Camb.ai.
 
@@ -106,8 +92,6 @@ class RealtimeModel(llm.RealtimeModel):
             api_key: Camb.ai API key. Falls back to the ``CAMB_API_KEY`` env var.
             base_url: Override the realtime endpoint, e.g. to reach a non-production
                 deployment. Defaults to whatever the installed SDK points at.
-            max_session_duration: Seconds before the connection is recycled. ``None``
-                keeps it open until the endpoint drops it, which it does at 3600s.
         """
         super().__init__(
             capabilities=llm.RealtimeCapabilities(
@@ -136,7 +120,6 @@ class RealtimeModel(llm.RealtimeModel):
             voice_id=voice_id,
             api_key=camb_api_key,
             base_url=base_url,
-            max_session_duration=max_session_duration,
         )
         self._sessions = weakref.WeakSet[RealtimeSession]()
 
@@ -196,93 +179,29 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
             )
             raise
 
-    async def _connect(self) -> CambSession:
-        overrides = {"base_url": self._opts.base_url} if self._opts.base_url else {}
-        return await camb_connect(
-            self._opts.api_key,
-            **overrides,
-            source_language=self._opts.source_language,
-            target_language=self._opts.target_language,
-            mode=self._opts.mode,
-            voice_id=self._opts.voice_id,
-        )
-
     async def _run(self) -> None:
-        retry_delay = _INITIAL_RETRY_DELAY
-        attempts = 0
-        reconnecting = False
+        try:
+            overrides = {"base_url": self._opts.base_url} if self._opts.base_url else {}
+            session = await camb_connect(
+                self._opts.api_key,
+                **overrides,
+                source_language=self._opts.source_language,
+                target_language=self._opts.target_language,
+                mode=self._opts.mode,
+                voice_id=self._opts.voice_id,
+            )
+        except RealtimeError as e:
+            raise APIConnectionError("failed to connect to the Camb.ai realtime endpoint") from e
 
-        while not self._msg_ch.closed:
-            try:
-                session = await self._connect()
-            except RealtimeError as e:
-                if not reconnecting:
-                    raise APIConnectionError(
-                        "failed to connect to the Camb.ai realtime endpoint"
-                    ) from e
-                attempts += 1
-                logger.warning(
-                    f"camb.ai realtime reconnect failed ({attempts}/{_MAX_CONNECT_FAILURES}): {e}"
-                )
-            else:
-                if reconnecting:
-                    self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
-                await self._run_session(session)
-                if session.is_ready:
-                    attempts = 0
-                    retry_delay = _INITIAL_RETRY_DELAY
-                else:
-                    attempts += 1
-
-            reconnecting = True
-            if self._msg_ch.closed:
-                break
-
-            if attempts >= _MAX_CONNECT_FAILURES:
-                raise APIConnectionError(
-                    f"camb.ai realtime failed to open a working session {attempts} times "
-                    "in a row; giving up"
-                )
-
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, _MAX_RETRY_DELAY)
-
-    async def _run_session(self, session: CambSession) -> bool:
         self._subscribe(session)
 
-        tasks = [
-            asyncio.create_task(self._send_task(session), name="cambai-realtime-send"),
-            asyncio.create_task(session.run_until_closed(), name="cambai-realtime-recv"),
-        ]
-        recycle: asyncio.Task[None] | None = None
-        if self._opts.max_session_duration is not None:
-            recycle = asyncio.create_task(
-                asyncio.sleep(self._opts.max_session_duration), name="cambai-realtime-recycle"
-            )
-            tasks.append(recycle)
-
+        tasks = [asyncio.create_task(self._send_task(session), name="cambai-realtime-send")]
         try:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                if task is not recycle:
-                    task.result()
-            recycled = recycle is not None and recycle in done
-            if recycled:
-                await self._drain_generation()
-            return recycled
-        except Exception as e:
-            logger.warning(f"camb.ai realtime session dropped: {e}")
-            return False
+            await asyncio.gather(session.run_until_closed(), *tasks)
         finally:
             await utils.aio.cancel_and_wait(*tasks)
-            with suppress(Exception):
-                await session.close()
+            await session.close()
             self._finish_generation()
-
-    async def _drain_generation(self) -> None:
-        deadline = time.monotonic() + _DRAIN_TIMEOUT
-        while self._current is not None and time.monotonic() < deadline:
-            await asyncio.sleep(0.1)
 
     def _subscribe(self, session: CambSession) -> None:
         def on_transcript(event: TranscriptCompletedEvent) -> None:
@@ -518,4 +437,4 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         await utils.aio.cancel_and_wait(self._main_atask)
 
 
-__all__ = ["RealtimeModel", "RealtimeSession", "DEFAULT_MAX_SESSION_DURATION"]
+__all__ = ["RealtimeModel", "RealtimeSession"]
