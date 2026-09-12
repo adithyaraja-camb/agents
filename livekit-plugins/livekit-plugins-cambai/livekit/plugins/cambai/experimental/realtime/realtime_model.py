@@ -50,10 +50,11 @@ DEFAULT_MAX_SESSION_DURATION = 50 * 60
 _DRAIN_TIMEOUT = 30.0
 _INITIAL_RETRY_DELAY = 1.0
 _MAX_RETRY_DELAY = 30.0
-# Consecutive sessions that never became ready. A session that did become ready and then
-# closed is not counted: the endpoint drops an idle connection after about 60 seconds, so
-# a speaker who stops talking produces exactly that, and it has to reconnect indefinitely.
-_MAX_RECONNECT_ATTEMPTS = 3
+# Consecutive sessions that carried no audio. The endpoint closes an idle connection
+# after about 60 seconds, so a room with nothing publishing reconnects once a minute
+# forever, translating nothing. A session that carried audio resets this, so a real
+# conversation is never cut off no matter how long it runs.
+_MAX_IDLE_SESSIONS = 3
 
 
 @dataclass
@@ -173,6 +174,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         self._pending_reply: asyncio.Future[llm.GenerationCreatedEvent] | None = None
         self._turn_started_at: float | None = None
         self._item_id = 0
+        self._frames_in = 0
 
         self._main_atask = asyncio.create_task(self._main_task(), name="cambai-realtime")
 
@@ -220,13 +222,14 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
                     ) from e
                 attempts += 1
                 logger.warning(
-                    f"camb.ai realtime reconnect failed ({attempts}/{_MAX_RECONNECT_ATTEMPTS}): {e}"
+                    f"camb.ai realtime reconnect failed ({attempts}/{_MAX_IDLE_SESSIONS}): {e}"
                 )
             else:
                 if reconnecting:
                     self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
+                before = self._frames_in
                 await self._run_session(session)
-                if session.is_ready:
+                if self._frames_in > before:
                     attempts = 0
                     retry_delay = _INITIAL_RETRY_DELAY
                 else:
@@ -236,9 +239,10 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
             if self._msg_ch.closed:
                 break
 
-            if attempts >= _MAX_RECONNECT_ATTEMPTS:
+            if attempts >= _MAX_IDLE_SESSIONS:
                 raise APIConnectionError(
-                    f"camb.ai realtime session failed {attempts} times in a row; giving up"
+                    f"camb.ai realtime session carried no audio {attempts} times in a row; "
+                    "giving up"
                 )
 
             await asyncio.sleep(retry_delay)
@@ -422,6 +426,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
         if self._turn_started_at is None:
             self._turn_started_at = time.time()
         for f in self._resample(frame):
+            self._frames_in += 1
             self._msg_ch.send_nowait(f.data.tobytes())
 
     def _resample(self, frame: rtc.AudioFrame) -> Iterator[rtc.AudioFrame]:
