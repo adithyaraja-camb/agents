@@ -50,6 +50,10 @@ DEFAULT_MAX_SESSION_DURATION = 50 * 60
 _DRAIN_TIMEOUT = 30.0
 _INITIAL_RETRY_DELAY = 1.0
 _MAX_RETRY_DELAY = 30.0
+# A scheduled handover always runs a full session, so only genuine failures reach this.
+# Bounded because an endpoint that accepts a connection and drops it immediately -- an
+# unpaid account answers exactly that way -- is not something retrying can fix.
+_MAX_RECONNECT_ATTEMPTS = 3
 
 
 @dataclass
@@ -203,6 +207,7 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
 
     async def _run(self) -> None:
         retry_delay = _INITIAL_RETRY_DELAY
+        attempts = 0
         reconnecting = False
 
         while not self._msg_ch.closed:
@@ -213,21 +218,35 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
                     raise APIConnectionError(
                         "failed to connect to the Camb.ai realtime endpoint"
                     ) from e
-                logger.warning(f"camb.ai realtime reconnect failed: {e}")
+                attempts += 1
+                logger.warning(
+                    f"camb.ai realtime reconnect failed ({attempts}/{_MAX_RECONNECT_ATTEMPTS}): {e}"
+                )
             else:
                 if reconnecting:
                     self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
-                retry_delay = _INITIAL_RETRY_DELAY
-                await self._run_session(session)
+                # A scheduled handover is the only end that means the session worked.
+                # Readiness and elapsed time do not separate it from an endpoint that
+                # accepts the session and drops it a minute later.
+                if await self._run_session(session):
+                    attempts = 0
+                    retry_delay = _INITIAL_RETRY_DELAY
+                else:
+                    attempts += 1
 
             reconnecting = True
             if self._msg_ch.closed:
                 break
 
+            if attempts >= _MAX_RECONNECT_ATTEMPTS:
+                raise APIConnectionError(
+                    f"camb.ai realtime session failed {attempts} times in a row; giving up"
+                )
+
             await asyncio.sleep(retry_delay)
             retry_delay = min(retry_delay * 2, _MAX_RETRY_DELAY)
 
-    async def _run_session(self, session: CambSession) -> None:
+    async def _run_session(self, session: CambSession) -> bool:
         self._subscribe(session)
 
         tasks = [
@@ -246,10 +265,13 @@ class RealtimeSession(llm.RealtimeSession[Literal["cambai_server_event_received"
             for task in done:
                 if task is not recycle:
                     task.result()
-            if recycle is not None and recycle in done:
+            recycled = recycle is not None and recycle in done
+            if recycled:
                 await self._drain_generation()
+            return recycled
         except Exception as e:
             logger.warning(f"camb.ai realtime session dropped: {e}")
+            return False
         finally:
             await utils.aio.cancel_and_wait(*tasks)
             with suppress(Exception):
